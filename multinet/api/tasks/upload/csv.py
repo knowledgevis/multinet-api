@@ -1,6 +1,6 @@
 import csv
 from io import StringIO
-from typing import Any, BinaryIO, Dict, Tuple
+from typing import BinaryIO, Dict, Tuple
 
 from celery import shared_task
 from celery.utils.log import get_task_logger
@@ -9,65 +9,38 @@ from multinet.api.models import Network, Table, TableTypeAnnotation, Upload, Wor
 from multinet.api.utils.arango import ArangoQuery
 
 from .common import ProcessUploadTask
-from .utils import processor_dict
+from .process_single_table import process_single_table
 
 logger = get_task_logger(__name__)
 
 
-def process_row(row: Dict[str, Any], cols: Dict[str, TableTypeAnnotation.Type]) -> Dict:
-    """Process a CSV row."""
-    new_row = dict(row)
-
-    for col_key, col_type in cols.items():
-        entry = row.get(col_key)
-
-        # If null entry, skip
-        if entry is None:
-            continue
-
-        process_func = processor_dict.get(col_type)
-        if process_func is not None:
-            try:
-                new_row[col_key] = process_func(entry)
-            except ValueError:
-                # If error processing row, keep as string
-                pass
-
-    return new_row
-
-
 @shared_task(base=ProcessUploadTask)
 def process_csv(
-    task_id: int, table_name: str, edge: bool, columns: Dict[str, TableTypeAnnotation.Type]
+    task_id: int,
+    table_name: str,
+    edge: bool,
+    columns: Dict[str, TableTypeAnnotation.Type],
+    delimiter: str,
+    quotechar: str,
 ) -> None:
     upload: Upload = Upload.objects.get(id=task_id)
 
     # Download data from S3/MinIO
     with upload.blob as blob_file:
         blob_file: BinaryIO = blob_file
-        csv_rows = list(csv.DictReader(StringIO(blob_file.read().decode('utf-8'))))
+        csv_reader = csv.DictReader(
+            StringIO(blob_file.read().decode('utf-8')),
+            delimiter=delimiter,
+            quotechar=quotechar,
+        )
 
-    # Cast entries in each row to appropriate type, if necessary
-    for i, row in enumerate(csv_rows):
-        csv_rows[i] = process_row(row, columns)
-
-    # Create new table
-    table: Table = Table.objects.create(
-        name=table_name,
-        edge=edge,
-        workspace=upload.workspace,
-    )
-
-    # Create type annotations
-    TableTypeAnnotation.objects.bulk_create(
-        [
-            TableTypeAnnotation(table=table, column=col_key, type=col_type)
-            for col_key, col_type in columns.items()
-        ]
-    )
-
-    # Insert rows
-    table.put_rows(csv_rows)
+        process_single_table(
+            csv_reader,
+            table_name,
+            upload.workspace,
+            edge,
+            columns,
+        )
 
 
 def maybe_insert_join_statement(query: str, bind_vars: Dict, table_dict: Dict) -> Tuple[str, Dict]:
@@ -214,6 +187,10 @@ def create_csv_network(workspace: Workspace, serializer):
                     FILTER edge_doc.@TARGET_LINK_LOCAL == dd.@TARGET_LINK_FOREIGN
                     return dd
             )
+
+            // Filter out missed joins
+            FILTER source_doc != null && target_doc != null
+
             // Add _from/_to to new doc, remove internal fields, insert into new coll
             LET excluded = APPEND(['_id', '_key', 'rev'], @EXCLUDED_COLS)
             LET new_edge_doc = MERGE(edge_doc, {'_from': source_doc._id, '_to': target_doc._id})

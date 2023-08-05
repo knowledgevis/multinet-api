@@ -19,7 +19,6 @@ from multinet.api.models import (
     WorkspaceRole,
     WorkspaceRoleChoice,
 )
-from multinet.api.tasks.upload.d3_json import d3_link_to_arango_doc, d3_node_to_arango_doc
 from multinet.api.tests.fuzzy import (
     INTEGER_ID_RE,
     TIMESTAMP_RE,
@@ -31,6 +30,7 @@ from multinet.api.views.upload import InvalidFieldValueResponse
 
 data_dir = pathlib.Path(__file__).parent / 'data'
 miserables_json_file = data_dir / 'miserables.json'
+miserables_key_from_to_json_file = data_dir / 'miserables-key-from-to.json'
 
 
 def json_upload(obj: IO[bytes], name: str, workspace, user):
@@ -63,11 +63,62 @@ def miserables_json(
     # Model creation request
     workspace.set_user_permission(user, WorkspaceRoleChoice.WRITER)
     network_name = f't{uuid.uuid4().hex}'
+    node_table_name = f't{uuid.uuid4().hex}_nodes'
+    edge_table_name = f't{uuid.uuid4().hex}_edges'
     r: Response = authenticated_api_client.post(
-        f'/api/workspaces/{workspace.name}/uploads/d3_json/',
+        f'/api/workspaces/{workspace.name}/uploads/json_network/',
         {
             'field_value': miserables_json_field_value,
             'network_name': network_name,
+            'node_table_name': node_table_name,
+            'edge_table_name': edge_table_name,
+            'node_columns': {'id': 'primary key', 'group': 'category'},
+            'edge_columns': {
+                'source': 'edge source',
+                'target': 'edge target',
+                'value': 'number',
+            },
+        },
+        format='json',
+    )
+    WorkspaceRole.objects.filter(workspace=workspace, user=user).delete()
+    return {
+        'response': r,
+        'network_name': network_name,
+    }
+
+
+@pytest.fixture
+def miserables_json_key_from_to_field_value(s3ff_field_value_factory, workspace, user) -> str:
+    upload = json_file_upload(miserables_key_from_to_json_file, workspace, user)
+    return s3ff_field_value_factory(upload.blob)
+
+
+@pytest.fixture
+def miserables_json_key_from_to(
+    workspace: Workspace,
+    user: User,
+    authenticated_api_client: APIClient,
+    miserables_json_key_from_to_field_value,
+) -> Dict:
+    # Model creation request
+    workspace.set_user_permission(user, WorkspaceRoleChoice.WRITER)
+    network_name = f't{uuid.uuid4().hex}'
+    node_table_name = f't{uuid.uuid4().hex}_nodes'
+    edge_table_name = f't{uuid.uuid4().hex}_edges'
+    r: Response = authenticated_api_client.post(
+        f'/api/workspaces/{workspace.name}/uploads/json_network/',
+        {
+            'field_value': miserables_json_key_from_to_field_value,
+            'network_name': network_name,
+            'node_table_name': node_table_name,
+            'edge_table_name': edge_table_name,
+            'node_columns': {'_key': 'primary key', 'group': 'category'},
+            'edge_columns': {
+                '_from': 'edge source',
+                '_to': 'edge target',
+                'value': 'number',
+            },
         },
         format='json',
     )
@@ -89,7 +140,7 @@ def test_create_upload_model(workspace: Workspace, user: User, miserables_json):
         'workspace': workspace_re(workspace),
         'blob': s3_file_field_re(miserables_json_file.name),
         'user': user.username,
-        'data_type': Upload.DataType.D3_JSON,
+        'data_type': Upload.DataType.JSON_NETWORK,
         'error_messages': None,
         'status': Upload.Status.PENDING,
         'created': TIMESTAMP_RE,
@@ -110,10 +161,18 @@ def test_create_upload_model_duplicate_names(
 
     def assert_response():
         r: Response = authenticated_api_client.post(
-            f'/api/workspaces/{workspace.name}/uploads/d3_json/',
+            f'/api/workspaces/{workspace.name}/uploads/json_network/',
             {
                 'field_value': miserables_json_field_value,
                 'network_name': network_name,
+                'node_table_name': f'{network_name}_nodes',
+                'edge_table_name': f'{network_name}_edges',
+                'node_columns': {'id': 'primary key', 'group': 'category'},
+                'edge_columns': {
+                    'source': 'edge source',
+                    'target': 'edge target',
+                    'value': 'number',
+                },
             },
             format='json',
         )
@@ -145,10 +204,18 @@ def test_create_upload_model_invalid_field_value(
     workspace.set_user_permission(user, WorkspaceRoleChoice.WRITER)
     network_name = f't{uuid.uuid4().hex}'
     r: Response = authenticated_api_client.post(
-        f'/api/workspaces/{workspace.name}/uploads/d3_json/',
+        f'/api/workspaces/{workspace.name}/uploads/json_network/',
         {
             'field_value': 'field_value',
             'network_name': network_name,
+            'node_table_name': f'{network_name}_nodes',
+            'edge_table_name': f'{network_name}_edges',
+            'node_columns': {'id': 'primary key', 'group': 'category'},
+            'edge_columns': {
+                'source': 'edge source',
+                'target': 'edge target',
+                'value': 'number',
+            },
         },
         format='json',
     )
@@ -172,7 +239,7 @@ def test_create_upload_model_invalid_permissions(
 
     network_name = f't{uuid.uuid4().hex}'
     r: Response = authenticated_api_client.post(
-        f'/api/workspaces/{workspace.name}/uploads/d3_json/',
+        f'/api/workspaces/{workspace.name}/uploads/json_network/',
         {
             'field_value': miserables_json_field_value,
             'network_name': network_name,
@@ -220,16 +287,90 @@ def test_valid_d3_json_task_response(
     # Get source data
     with open(miserables_json_file) as file_stream:
         loaded_miserables_json_file = json.load(file_stream)
-        nodes = sorted(
-            (d3_node_to_arango_doc(node) for node in loaded_miserables_json_file['nodes']),
-            key=operator.itemgetter('_key'),
+        nodes = sorted(loaded_miserables_json_file['nodes'], key=operator.itemgetter('id'))
+        links = sorted(loaded_miserables_json_file['links'], key=operator.itemgetter('source'))
+
+    # Check that nodes were ingested correctly
+    r: Response = authenticated_api_client.get(
+        f'/api/workspaces/{workspace.name}/networks/{network_name}/nodes/'
+    )
+
+    r_json = r.json()
+    assert r.status_code == 200
+    assert r_json['count'] == len(nodes)
+
+    results = sorted(r_json['results'], key=operator.itemgetter('_key'))
+    for i, node in enumerate(nodes):
+        results[i]['group'] = int(results[i]['group'])
+        node['_key'] = str(node['id'])
+        del node['id']
+        assert results[i] == dict_to_fuzzy_arango_doc(node)
+
+    # Check that links were ingested correctly
+    r: Response = authenticated_api_client.get(
+        f'/api/workspaces/{workspace.name}/networks/{network_name}/edges/'
+    )
+
+    r_json = r.json()
+    assert r.status_code == 200
+    assert r_json['count'] == len(links)
+
+    results = sorted(r_json['results'], key=operator.itemgetter('_from'))
+    for i, link in enumerate(links):
+        results[i]['_from'] = results[i]['_from'].split('/')[1]
+        results[i]['_to'] = results[i]['_to'].split('/')[1]
+        link['_from'] = str(link['source'])
+        link['_to'] = str(link['target'])
+        del link['source'], link['target']
+        assert results[i] == dict_to_fuzzy_arango_doc(link)
+
+
+@pytest.mark.django_db
+def test_valid_d3_json_task_response_key_from_to(
+    workspace: Workspace,
+    user: User,
+    authenticated_api_client: APIClient,
+    miserables_json_key_from_to,
+):
+    """Test just the response of the model creation, not the task itself."""
+    # Get upload info
+    workspace.set_user_permission(user, WorkspaceRoleChoice.WRITER)
+    r = miserables_json_key_from_to['response']
+    network_name = miserables_json_key_from_to['network_name']
+    node_table_name = f'{network_name}_nodes'
+    edge_table_name = f'{network_name}_edges'
+
+    # Since we're running with celery_task_always_eager=True, this job is finished
+    r: Response = authenticated_api_client.get(
+        f'/api/workspaces/{workspace.name}/uploads/{r.json()["id"]}/'
+    )
+
+    r_json = r.json()
+    assert r.status_code == 200
+    assert r_json['status'] == Upload.Status.FINISHED
+    assert r_json['error_messages'] is None
+
+    # Check that tables are created
+    for table_name in (node_table_name, edge_table_name):
+        r: Response = authenticated_api_client.get(
+            f'/api/workspaces/{workspace.name}/tables/{table_name}/'
         )
-        links = sorted(
-            (
-                d3_link_to_arango_doc(link, node_table_name)
-                for link in loaded_miserables_json_file['links']
-            ),
-            key=operator.itemgetter('_from'),
+        assert r.status_code == 200
+
+    # Check that network was created
+    r: Response = authenticated_api_client.get(
+        f'/api/workspaces/{workspace.name}/networks/{network_name}/'
+    )
+    assert r.status_code == 200
+
+    # Get source data
+    with open(miserables_key_from_to_json_file) as file_stream:
+        loaded_miserables_key_from_to_json_file = json.load(file_stream)
+        nodes = sorted(
+            loaded_miserables_key_from_to_json_file['nodes'], key=operator.itemgetter('_key')
+        )
+        edges = sorted(
+            loaded_miserables_key_from_to_json_file['edges'], key=operator.itemgetter('_from')
         )
 
     # Check that nodes were ingested correctly
@@ -243,6 +384,7 @@ def test_valid_d3_json_task_response(
 
     results = sorted(r_json['results'], key=operator.itemgetter('_key'))
     for i, node in enumerate(nodes):
+        results[i]['group'] = int(results[i]['group'])
         assert results[i] == dict_to_fuzzy_arango_doc(node, exclude=['_key'])
 
     # Check that links were ingested correctly
@@ -252,10 +394,12 @@ def test_valid_d3_json_task_response(
 
     r_json = r.json()
     assert r.status_code == 200
-    assert r_json['count'] == len(links)
+    assert r_json['count'] == len(edges)
 
     results = sorted(r_json['results'], key=operator.itemgetter('_from'))
-    for i, link in enumerate(links):
+    for i, link in enumerate(edges):
+        results[i]['_from'] = results[i]['_from'].split('/')[1]
+        results[i]['_to'] = results[i]['_to'].split('/')[1]
         assert results[i] == dict_to_fuzzy_arango_doc(link)
 
 
@@ -292,10 +436,18 @@ def test_d3_json_task_filter_missing(
     node_table_name = f'{network_name}_nodes'
     edge_table_name = f'{network_name}_edges'
     upload_resp: Response = authenticated_api_client.post(
-        f'/api/workspaces/{workspace.name}/uploads/d3_json/',
+        f'/api/workspaces/{workspace.name}/uploads/json_network/',
         {
             'field_value': field_value,
             'network_name': network_name,
+            'node_table_name': node_table_name,
+            'edge_table_name': edge_table_name,
+            'node_columns': {'id': 'primary key', 'group': 'category'},
+            'edge_columns': {
+                'source': 'edge source',
+                'target': 'edge target',
+                'value': 'number',
+            },
         },
         format='json',
     )

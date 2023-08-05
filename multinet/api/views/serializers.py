@@ -2,7 +2,16 @@ from django.contrib.auth.models import User
 from django.contrib.auth.validators import UnicodeUsernameValidator
 from rest_framework import serializers
 
-from multinet.api.models import AqlQuery, Network, Table, TableTypeAnnotation, Upload, Workspace
+from multinet.api.models import (
+    AqlQuery,
+    Network,
+    NetworkSession,
+    Table,
+    TableSession,
+    TableTypeAnnotation,
+    Upload,
+    Workspace,
+)
 
 
 # The default ModelSerializer for User fails if the user already exists
@@ -230,6 +239,18 @@ class NetworkTablesSerializer(serializers.Serializer):
     type = serializers.ChoiceField(choices=['node', 'edge', 'all'], default='all', required=False)
 
 
+class NetworkSessionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NetworkSession
+        fields = '__all__'
+
+
+class TableSessionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TableSession
+        fields = '__all__'
+
+
 class UploadCreateSerializer(serializers.Serializer):
     field_value = serializers.CharField()
 
@@ -248,14 +269,30 @@ class UploadReturnSerializer(serializers.ModelSerializer):
     user = serializers.CharField()
 
 
+columns_type = serializers.DictField(
+    child=serializers.ChoiceField(choices=TableTypeAnnotation.Type.choices),
+)
+
+
 class CSVUploadCreateSerializer(UploadCreateSerializer):
     edge = serializers.BooleanField()
     table_name = serializers.CharField()
-    columns = serializers.DictField(
-        child=serializers.ChoiceField(choices=TableTypeAnnotation.Type.choices),
-        default=dict,
-    )
+    columns = columns_type
+    delimiter = serializers.CharField(trim_whitespace=False)
+    quotechar = serializers.CharField()
 
 
-class D3JSONUploadCreateSerializer(UploadCreateSerializer):
+class JSONTableUploadCreateSerializer(UploadCreateSerializer):
+    edge = serializers.BooleanField()
+    table_name = serializers.CharField()
+    columns = columns_type
+
+
+class JSONNetworkUploadCreateSerializer(UploadCreateSerializer):
     network_name = serializers.CharField()
+    node_columns = serializers.DictField(
+        child=serializers.ChoiceField(choices=TableTypeAnnotation.Type.choices)
+    )
+    edge_columns = serializers.DictField(
+        child=serializers.ChoiceField(choices=TableTypeAnnotation.Type.choices)
+    )
